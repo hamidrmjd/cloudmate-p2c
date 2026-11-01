@@ -1,8 +1,8 @@
 # CloudMate P2C — Project to Container
 
-**Turn a public GitHub project into a running Docker container on your own server.**
+**Run public GitHub projects and Linux binary tools in Docker containers on your own server—with an optional web dashboard.**
 
-CloudMate P2C is a self-hosted deployment dashboard. Give it a public GitHub repository, choose a branch and ports, and it clones the source, detects a supported runtime, builds a Docker image, and starts the application on your Docker host. The dashboard shows deployment progress, build output, and application logs.
+CloudMate P2C is a self-hosted deployment dashboard. Give it a public GitHub repository, choose a branch and tool arguments, and it clones the source, detects a supported runtime, builds a Docker image, and runs the tool on your Docker host. Command-line mode is the default; you can optionally publish a tool’s existing web dashboard. The dashboard shows deployment progress, build output, and application logs.
 
 > **Status: early prototype.** Intended for a single operator deploying trusted repositories on a dedicated host. It is not a multi-tenant platform or a production-hardened service. The repository includes mocked deployment tests; a real Docker deployment has not yet been verified in the development environment.
 
@@ -30,7 +30,10 @@ CloudMate P2C is a self-hosted deployment dashboard. Give it a public GitHub rep
 - Generated Dockerfile templates for supported Node.js and Python applications.
 - Asynchronous deployments with up to two workers.
 - Unique Docker image and container names for each deployment.
-- Configurable application and published host ports.
+- Command-line tools by default, without publishing ports.
+- Prebuilt Linux ELF binaries using a repository-relative executable path.
+- Literal tool arguments, successful one-shot completion, and exit codes.
+- Optional web dashboard mode with configurable application and host ports.
 - Build output and polled container logs.
 - Authenticated API and container stop controls.
 - Default loopback binding for local access or SSH forwarding.
@@ -48,7 +51,7 @@ CloudMate P2C is a self-hosted deployment dashboard. Give it a public GitHub rep
 | Docker | A running Docker Engine compatible with `build`, `run`, `inspect`, `logs`, and `stop`. |
 | Docker access | The server process user must be allowed to access the Docker daemon. Docker access grants substantial host privileges. |
 | Network | Outbound access to GitHub, container registries, and your application's package registries. |
-| Published ports | An available host port from **1024–65535** per deployment. Open the chosen application port in your firewall only when required. |
+| Published ports | Only for dashboard mode: an available host port from **1024–65535** per deployment. Open the chosen application port in your firewall only when required. |
 | Resources | Enough disk, RAM, and CPU to clone and build your application. Each started container is limited to **512 MB RAM and 1 CPU**; builds have no equivalent resource limit. |
 | Browser | A modern JavaScript-enabled browser. HTTPS or localhost is recommended. |
 
@@ -59,8 +62,8 @@ CloudMate P2C is a self-hosted deployment dashboard. Give it a public GitHub rep
 - A **public** repository at `https://github.com/OWNER/REPOSITORY`.
 - A valid branch name, such as `main`.
 - A supported project layout or a repository-provided Dockerfile.
-- A server process that listens on **`0.0.0.0`**, rather than only localhost inside the container.
-- The correct application port. CloudMate does not automatically infer listening ports.
+- For dashboard mode, an application that already provides a web UI and listens on **`0.0.0.0`**, rather than only localhost inside the container.
+- For dashboard mode, the correct application port. CLI tools do not require any ports.
 - No requirement for interactive setup or private registry credentials in the current version.
 
 ## Quick start
@@ -102,34 +105,57 @@ The token is retained in the browser's session storage. The API address is retai
 
 1. Paste the public GitHub repository URL.
 2. Select **Inspect repository** to retrieve its default branch, or enter the branch manually.
-3. Select **Detect automatically**, **Node.js**, **Python**, or **Existing Dockerfile**.
-4. Enter the port your application listens on inside its container.
-5. Choose an available published server port, such as `8080`.
-6. Select **Build & deploy**.
-7. Open the project's **View logs** panel to follow the job.
-8. When its status is **Running**, access `http://YOUR_SERVER:HOST_PORT`, subject to your firewall and routing configuration.
+3. Leave **Command-line tool (default)** selected for a CLI tool.
+4. Select **Detect automatically**, **Binary tool**, **Existing Dockerfile**, **Node.js**, or **Python**.
+5. For **Binary tool**, enter the repository-relative path, such as `bin/mytool`.
+6. Enter optional tool arguments, **one argument per line**. A line containing spaces is one argument. Do not add shell quotes or shell commands.
+7. If the tool has its own web UI, select **Tool with web dashboard**, provide its startup arguments, and choose container and published server ports.
+8. Connect a Docker server, then select **Build & deploy**. You can configure the form before connecting.
+9. Open **View logs** to follow the build and execution.
 
 Deployment states:
 
 ```text
 Queued → Cloning → Building → Starting → Running
-                  Any error → Failed
-                   Stop action → Stopped
+                              └──────→ Completed (CLI exit code 0)
+                 Any command error ──→ Failed
+                    Stop action ─────→ Stopped
 ```
 
-“Running” means the container process was running two seconds after startup. It does not verify an HTTP endpoint or continuously monitor the process afterward.
+### Binary CLI example
 
-Use the **Stop container** control in the logs panel to stop an existing deployment. A new deployment creates a separate image and container; it does not replace the previous one. Select another host port or stop the previous container first.
+For a repository containing `bin/mytool`, select **Binary tool**, leave command-line mode selected, and enter `bin/mytool` as the binary path. For a help command, enter `--help` on one argument line.
+
+The file must be a **prebuilt Linux ELF executable compatible with the Docker host architecture**. CloudMate copies it into a Debian slim image and runs it as an unprivileged user. Additional shared libraries and compilation are not inferred: provide a Dockerfile for binaries needing extra dependencies or a build step. The binary must be included in the repository's Docker build context, including any `.dockerignore` rules. GitHub release downloads are not supported by this option.
+
+CLI containers publish no ports and use Docker's `--restart no` policy. A tool exiting with code `0` is **Completed**; a nonzero exit is **Failed**. Long-running tools are **Running**, and active jobs are rechecked when the dashboard polls. Output is retained in the container and accessible through the logs panel. Interactive terminals, standard-input sessions, host bind mounts, and a Run again action are not available; submit another deployment to run again.
+
+### Optional tool dashboard
+
+Select **Tool with web dashboard** only when the tool already supports a web server. Supply its documented arguments, for example one per line:
+
+```text
+serve
+--host=0.0.0.0
+--port=9000
+```
+
+Set the container port to `9000` and an available server port, such as `8080`. When running, access `http://YOUR_SERVER:8080`, subject to firewall and routing settings. This option publishes the existing web UI; it does not generate a dashboard for an arbitrary CLI program. Dashboard services use `unless-stopped` restarts. An exited dashboard is marked Failed, even if its exit code is zero.
+
+With a repository-provided Dockerfile, supplied arguments replace its `CMD` and are passed to its `ENTRYPOINT`, following Docker semantics. With generated templates, arguments are passed to the binary, `npm start --`, or `python app.py`.
+
+Use **Stop container** in the logs panel to stop a deployment. A new deployment creates a separate image and container and does not replace the previous one. Select another dashboard host port or stop its previous container first. “Running” indicates the process state, not an HTTP health check.
 
 ## Supported runtimes
 
 | Runtime | Detection | Behavior and prerequisites |
 | --- | --- | --- |
+| Binary tool | Explicit `binaryPath` | Copies a prebuilt Linux ELF executable into `debian:bookworm-slim`, sets an executable entry point, and runs as UID 65532. Select this runtime in the UI. |
 | Existing Dockerfile | Root `Dockerfile` | Builds the repository's Dockerfile. Use this for custom frameworks, entry points, or system packages. |
-| Node.js | Root `package.json` | Requires `package-lock.json`; runs `npm ci`, optional `npm run build`, then `npm start`, using `node:22-alpine`. Sets `NODE_ENV`, `HOSTNAME`, and `PORT`. |
+| Node.js | Root `package.json` | Requires `package-lock.json`; runs `npm ci`, optional `npm run build`, then `npm start --` (plus supplied arguments), using `node:22-alpine`. Sets `NODE_ENV`, `HOSTNAME`, and `PORT`. |
 | Python | Root `requirements.txt` | Installs dependencies using `python:3.12-slim`, then runs `python app.py`. Your app must configure its own binding address and listening port. |
 
-Automatic detection checks in this order: **Dockerfile → package.json → requirements.txt**. Projects without any of these files fail with a runtime-detection message.
+Automatic detection uses an explicit API `binaryPath` first, otherwise checks **Dockerfile → package.json → requirements.txt**. The UI shows the executable path field when **Binary tool** is selected. Projects without any of these files fail with a runtime-detection message.
 
 The generated Node.js template supports npm projects only. Yarn, pnpm, monorepos, compiled Python system dependencies, alternate Python entry points, and static sites should provide an appropriate Dockerfile. Template base-image versions are defaults in this source, not a statement about current upstream support.
 
@@ -230,7 +256,7 @@ Authorization: Bearer YOUR_CLOUDMATE_TOKEN
 | `GET` | `/api/projects/{id}/logs` | Build output plus recent container stdout. |
 | `POST` | `/api/projects/{id}/stop` | Stop the deployment's container. |
 
-Example deployment request, issued on the management server:
+Example dashboard deployment request, issued on the management server:
 
 ```sh
 curl --fail-with-body http://127.0.0.1:8787/api/projects \
@@ -240,12 +266,28 @@ curl --fail-with-body http://127.0.0.1:8787/api/projects \
     "repo": "https://github.com/OWNER/REPOSITORY",
     "branch": "main",
     "runtime": "auto",
+    "mode": "dashboard",
     "port": 3000,
     "hostPort": 8080
   }'
 ```
 
-Runtime values: `auto`, `docker`, `node`, or `python`. Container ports must be 1–65535; published host ports must be 1024–65535. Repository paths and branch names are validated. Git and Docker commands use argument lists rather than shell interpolation.
+Runtime values: `auto`, `docker`, `node`, `python`, or `binary`. Mode defaults to `tool`, which ignores port fields and publishes no ports. With `mode: "dashboard"`, container ports must be 1–65535 and host ports 1024–65535. `binaryPath` is required for `runtime: "binary"`. `arguments` is an optional array of literal strings; shell expansion is not performed. Repository paths and branch names are validated. Git and Docker commands use argument lists rather than shell interpolation.
+
+Example binary CLI request:
+
+```json
+{
+  "repo": "https://github.com/OWNER/REPOSITORY",
+  "branch": "main",
+  "runtime": "binary",
+  "mode": "tool",
+  "binaryPath": "bin/mytool",
+  "arguments": ["--help"]
+}
+```
+
+Existing clients that deploy web services must explicitly send `"mode": "dashboard"` after this update. Omitted mode now means command-line execution with no published port.
 
 ## Development and tests
 
@@ -259,7 +301,7 @@ python3 -m py_compile server.py
 node --check dist/app.js
 ```
 
-Current tests mock Git and Docker commands. They verify a successful deployment flow, clone failure behavior, and detection of a container that exits at startup. They do **not** verify a real Docker build, network routing, application health, browser behavior, or public deployment security.
+Current tests mock Git and Docker commands. They verify CLI defaults, argument handling, optional dashboard ports, successful and failed exits, completion during polling, binary template generation, executable path validation, symlink rejection, and clone failures. They do **not** verify a real Docker build, network routing, application health, browser behavior, or public deployment security.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and [REQUIREMENTS.md](REQUIREMENTS.md) for the implementation scope.
 
@@ -275,6 +317,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and [REQUIREMEN
 | Node build fails | Ensure `package-lock.json` is committed and `npm start` works. Inspect dependency and build output. |
 | Python container exits | Ensure `app.py` exists and runs the server. Use a Dockerfile for another entry point. |
 | Container is running but unreachable | Check that the app binds to `0.0.0.0`, the application port matches the form, and the host firewall permits the published port. |
+| Binary cannot execute | Use a Linux ELF binary for the Docker host architecture. Supply a Dockerfile if it requires extra shared libraries. |
+| CLI process completed | Exit code 0 is expected success for a one-shot tool. Check logs for its result. |
 | Published port is busy | Select a different host port or stop the container/process already using it. |
 | Log panel updates in chunks | Build commands buffer their output until they finish; this is not streaming build output. |
 | Projects disappear after restart | Job records are currently in memory. Containers and checkout directories remain on the server. |
@@ -286,10 +330,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and [REQUIREMEN
 - Use an SSH tunnel for remote prototype access. If exposing a management endpoint, use HTTPS, network restrictions, and a reverse proxy.
 - Do not commit tokens, `.env` files, private keys, or application secrets. There is no application environment-variable editor or secrets store in this version.
 - Generated templates copy repository contents into the image. Include a suitable `.dockerignore` to exclude secrets and unnecessary files.
-- Job history is not persisted, and container status is not reconciled continuously or recovered when the Python server restarts.
+- Job history is not persisted or recovered when the Python server restarts. Running jobs are reconciled when `/api/projects` is requested; there is no independent monitoring service.
 - Public repositories only. No GitHub OAuth flow, private repositories, submodule setup, or private registry authentication.
 - No automatic app TLS, domain setup, reverse proxy routing, rollback, zero-downtime replacement, persistent volumes, health checks, or scheduled redeployments.
-- Build output is buffered and bounded in memory; recent application logs are polled. The live log endpoint currently returns container stdout; build/startup diagnostics may also include stderr.
+- Build output is buffered and bounded in memory; recent application stdout and stderr are polled.
 - Checkouts, images, and stopped containers require manual cleanup. The stop action does not delete them.
 - The interface uses externally hosted Google Fonts when available; system fonts are the fallback.
 
@@ -297,7 +341,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and [REQUIREMEN
 
 Planned work, **not implemented**:
 
-- Durable deployment history and container reconciliation after restarts.
+- Durable deployment history and container recovery after restarts.
 - Real Docker integration tests and browser verification.
 - Streaming logs and application health checks.
 - Secure secret injection and configurable start commands.

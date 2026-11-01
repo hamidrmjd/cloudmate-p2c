@@ -19,40 +19,150 @@ def run(job, args, cwd=None, timeout=600):
     if result.returncode: raise RuntimeError('Command failed (exit %s)' % result.returncode)
     return result.stdout.strip()
 
+def deployment_config(body):
+    if not isinstance(body, dict):
+        raise ValueError('Expected a JSON object')
+    repo = str(body.get('repo', '')).rstrip('/').removesuffix('.git')
+    branch = str(body.get('branch', 'main'))
+    runtime = body.get('runtime', 'auto')
+    mode = body.get('mode', 'tool')
+    if not re.fullmatch(r'https://github\.com/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*', repo):
+        raise ValueError('Use a public github.com repository URL')
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./-]{0,150}', branch) or '..' in branch:
+        raise ValueError('Invalid branch')
+    if runtime not in ['auto', 'node', 'python', 'docker', 'binary']:
+        raise ValueError('Invalid runtime')
+    if mode not in ['tool', 'dashboard']:
+        raise ValueError('Mode must be tool or dashboard')
+    binary_path = body.get('binaryPath', '')
+    if not isinstance(binary_path, str):
+        raise ValueError('Binary path must be a string')
+    if binary_path:
+        path = pathlib.PurePosixPath(binary_path)
+        if (path.is_absolute() or any(part in ('', '.', '..') for part in binary_path.split('/'))
+                or not re.fullmatch(r'[A-Za-z0-9_./-]{1,240}', binary_path)):
+            raise ValueError('Binary path must be a relative repository file path, such as bin/mytool')
+    if runtime == 'binary' and not binary_path:
+        raise ValueError('Select the repository path to the Linux binary')
+    arguments = body.get('arguments', [])
+    if (not isinstance(arguments, list) or len(arguments) > 64
+            or any(not isinstance(arg, str) or len(arg) > 4096 or '\x00' in arg for arg in arguments)):
+        raise ValueError('Arguments must be an array of at most 64 strings without NUL characters')
+    port = hostport = None
+    if mode == 'dashboard':
+        for name in ('port', 'hostPort'):
+            value = body.get(name, 3000)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError('Dashboard ports must be integers')
+        port, hostport = body.get('port', 3000), body.get('hostPort', 3000)
+        if not (1 <= port <= 65535 and 1024 <= hostport <= 65535):
+            raise ValueError('Invalid ports; host port must be 1024 or higher')
+    return dict(repo=repo, branch=branch, runtime=runtime, mode=mode,
+                binaryPath=binary_path, arguments=arguments, port=port, hostPort=hostport)
+
+
+def prepare_dockerfile(job, work):
+    kind = job['runtime']
+    if kind == 'auto':
+        kind = ('binary' if job.get('binaryPath') else 'docker' if (work/'Dockerfile').is_file()
+                else 'node' if (work/'package.json').is_file()
+                else 'python' if (work/'requirements.txt').is_file() else '')
+    if not kind:
+        raise RuntimeError('Runtime not detected. Add a Dockerfile or select Binary tool and its executable path.')
+    job['detectedRuntime'] = kind
+    if kind == 'docker':
+        if not (work/'Dockerfile').is_file():
+            raise RuntimeError('Repository has no Dockerfile')
+        return 'Dockerfile'
+    expose = ('EXPOSE %s\n' % job['port']) if job.get('mode') == 'dashboard' else ''
+    if kind == 'binary':
+        relative = job['binaryPath']
+        binary = work / relative
+        try:
+            binary.resolve().relative_to(work.resolve())
+        except ValueError:
+            raise RuntimeError('Binary path must stay inside the repository')
+        # Reject symlinks, including parent directories, before the COPY instruction.
+        if work.is_symlink() or any((work.joinpath(*pathlib.PurePosixPath(relative).parts[:i])).is_symlink()
+                                    for i in range(1, len(pathlib.PurePosixPath(relative).parts) + 1)):
+            raise RuntimeError('Binary path cannot contain symlinks')
+        if not binary.is_file():
+            raise RuntimeError('Binary not found: ' + relative)
+        with binary.open('rb') as stream:
+            if stream.read(4) != b'\x7fELF':
+                raise RuntimeError('Select a prebuilt Linux ELF executable. Use a Dockerfile to compile source code.')
+        content = ('FROM debian:bookworm-slim\nWORKDIR /app\n'
+                   + 'COPY ' + json.dumps([relative, '/usr/local/bin/cloudmate-tool']) + '\n'
+                   + 'RUN chmod 755 /usr/local/bin/cloudmate-tool\n'
+                   + expose + 'USER 65532:65532\nENTRYPOINT ["/usr/local/bin/cloudmate-tool"]\n')
+    elif kind == 'node':
+        if not (work/'package-lock.json').is_file():
+            raise RuntimeError('Node deployment requires package-lock.json, or provide a Dockerfile.')
+        content = ('FROM node:22-alpine\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci\n'
+                   'COPY . .\nRUN npm run build --if-present\nENV NODE_ENV=production\n'
+                   'ENV HOSTNAME=0.0.0.0\nENV PORT=%s\n' % (job.get('port') or 3000)
+                   + expose + 'ENTRYPOINT ["npm", "start", "--"]\n')
+    else:
+        content = ('FROM python:3.12-slim\nWORKDIR /app\nCOPY requirements.txt ./\n'
+                   'RUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\n'
+                   + expose + 'ENTRYPOINT ["python", "app.py"]\n')
+    target = work / 'Dockerfile.cloudmate'
+    if target.is_symlink():
+        raise RuntimeError('Generated Dockerfile path is a symlink.')
+    target.write_text(content)
+    return target.name
+
+
+def record_state(job, state):
+    with LOCK:
+        if job['status'] == 'Stopped':
+            return
+        if state.get('Running'):
+            job['status'] = 'Running'
+        else:
+            job['exitCode'] = state.get('ExitCode')
+            if job.get('mode', 'tool') == 'tool' and state.get('ExitCode') == 0:
+                job['status'] = 'Completed'
+            else:
+                job['status'] = 'Failed'
+                job['logs'] += '\nContainer exited (code %s). See application logs.\n' % state.get('ExitCode')
+
+
+def refresh_state(job):
+    if job.get('container') and job['status'] == 'Running':
+        try:
+            result = subprocess.run(['docker', 'inspect', '--format', '{{json .State}}', job['container']],
+                                    capture_output=True, text=True, timeout=15)
+            if result.returncode == 0:
+                record_state(job, json.loads(result.stdout))
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+
+
 def deploy(job):
     work = DATA / job['id']
     try:
         with LOCK: job['status'] = 'Cloning'
         run(job, ['git', '-c', 'core.hooksPath=/dev/null', 'clone', '--depth', '1', '--branch', job['branch'], '--', job['repo'] + '.git', str(work)], timeout=120)
-        kind = job['runtime']
-        if kind == 'auto':
-            kind = 'docker' if (work/'Dockerfile').is_file() else 'node' if (work/'package.json').is_file() else 'python' if (work/'requirements.txt').is_file() else ''
-        if not kind: raise RuntimeError('Runtime not detected. Add a Dockerfile or select a runtime.')
-        job['detectedRuntime'] = kind
-        dockerfile = 'Dockerfile'
-        if kind == 'node':
-            if not (work/'package-lock.json').is_file(): raise RuntimeError('Node deployment requires package-lock.json, or provide a Dockerfile.')
-            content = 'FROM node:22-alpine\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci\nCOPY . .\nRUN npm run build --if-present\nENV NODE_ENV=production\nENV HOSTNAME=0.0.0.0\nENV PORT=%s\nEXPOSE %s\nCMD ["npm", "start"]\n' % (job['port'], job['port'])
-        elif kind == 'python':
-            content = 'FROM python:3.12-slim\nWORKDIR /app\nCOPY requirements.txt ./\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\nEXPOSE %s\nCMD ["python", "app.py"]\n' % job['port']
-        else: content = None
-        if content:
-            dockerfile = 'Dockerfile.cloudmate'
-            target = work/dockerfile
-            if target.is_symlink(): raise RuntimeError('Generated Dockerfile path is a symlink.')
-            target.write_text(content)
+        dockerfile = prepare_dockerfile(job, work)
         with LOCK: job['status'] = 'Building'
         image = 'cloudmate:' + job['id']
         run(job, ['docker', 'build', '-f', dockerfile, '-t', image, '.'], cwd=work)
         with LOCK: job['status'] = 'Starting'
         name = 'cloudmate-' + job['id']
-        cid = run(job, ['docker', 'run', '-d', '--name', name, '--label', 'cloudmate.managed=true', '--restart', 'unless-stopped', '--memory', '512m', '--cpus', '1', '--security-opt', 'no-new-privileges', '-p', '%s:%s' % (job['hostPort'],job['port']), image], timeout=45)
+        dashboard = job.get('mode', 'tool') == 'dashboard'
+        command = ['docker', 'run', '-d', '--name', name, '--label', 'cloudmate.managed=true',
+                   '--restart', 'unless-stopped' if dashboard else 'no', '--memory', '512m', '--cpus', '1',
+                   '--security-opt', 'no-new-privileges']
+        if dashboard:
+            command += ['-p', '%s:%s' % (job['hostPort'], job['port'])]
+        command += [image, *job.get('arguments', [])]
+        cid = run(job, command, timeout=45)
         with LOCK: job['container'] = cid
         time.sleep(2)
-        state = run(job, ['docker', 'inspect', '--format', '{{.State.Running}}', cid], timeout=15)
+        state = json.loads(run(job, ['docker', 'inspect', '--format', '{{json .State}}', cid], timeout=15))
         run(job, ['docker', 'logs', '--tail', '100', cid], timeout=15)
-        if state != 'true': raise RuntimeError('Container exited. See application logs.')
-        with LOCK: job['status'] = 'Running'
+        record_state(job, state)
     except Exception as e:
         with LOCK:
             job['status'] = 'Failed'
@@ -91,6 +201,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.reply({'docker':result.returncode==0,'version':result.stdout.strip()})
             except (OSError,subprocess.TimeoutExpired): self.reply({'docker':False,'version':''})
         elif path == '/api/projects':
+            with LOCK: jobs = list(JOBS.values())
+            for job in jobs: refresh_state(job)
             with LOCK: value=json.loads(json.dumps(list(JOBS.values())))
             self.reply(value)
         elif re.fullmatch(r'/api/projects/[a-f0-9]{12}/logs',path):
@@ -98,7 +210,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if not job: return self.reply({'error':'Not found'},404)
             live=''
             if job.get('container'):
-                try: live=subprocess.run(['docker','logs','--tail','150',job['container']],capture_output=True,text=True,timeout=10).stdout
+                try:
+                    result=subprocess.run(['docker','logs','--tail','150',job['container']],capture_output=True,text=True,timeout=10)
+                    live=result.stdout + result.stderr
                 except (OSError,subprocess.TimeoutExpired): pass
             self.reply({'logs':job['logs']+'\n'+live})
         else: self.reply({'error':'Not found'},404)
@@ -110,17 +224,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             body=json.loads(self.rfile.read(length))
             path=urllib.parse.urlparse(self.path).path
             if path=='/api/projects':
-                repo=str(body.get('repo','')).rstrip('/').removesuffix('.git')
-                branch=str(body.get('branch','main')); runtime=body.get('runtime','auto')
-                port=int(body.get('port',3000)); hostport=int(body.get('hostPort',3000))
-                if not re.fullmatch(r'https://github\.com/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*',repo): raise ValueError('Use a public github.com repository URL')
-                if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./-]{0,150}',branch) or '..' in branch: raise ValueError('Invalid branch')
-                if runtime not in ['auto','node','python','docker']: raise ValueError('Invalid runtime')
-                if not (1<=port<=65535 and 1024<=hostport<=65535): raise ValueError('Invalid ports; host port must be 1024 or higher')
+                config = deployment_config(body)
                 with LOCK:
                     if len(JOBS)>=100: return self.reply({'error':'Project limit reached; restart to clear history'},409)
-                    if any(j['hostPort']==hostport and j['status'] not in ['Failed','Stopped'] for j in JOBS.values()): return self.reply({'error':'Host port already assigned'},409)
-                    job={'id':uuid.uuid4().hex[:12],'name':repo.split('/')[-1],'repo':repo,'branch':branch,'runtime':runtime,'port':port,'hostPort':hostport,'status':'Queued','logs':'','created':time.time()}
+                    if config['mode'] == 'dashboard' and any(
+                            j.get('hostPort') == config['hostPort'] and
+                            j['status'] not in ['Failed', 'Stopped', 'Completed'] for j in JOBS.values()):
+                        return self.reply({'error':'Host port already assigned'},409)
+                    job = {**config, 'id':uuid.uuid4().hex[:12], 'name':config['repo'].split('/')[-1],
+                           'status':'Queued', 'logs':'', 'created':time.time()}
                     JOBS[job['id']]=job
                 POOL.submit(deploy,job); self.reply(job,202)
             elif re.fullmatch(r'/api/projects/[a-f0-9]{12}/stop',path):
