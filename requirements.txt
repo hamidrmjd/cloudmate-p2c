@@ -1,0 +1,3 @@
+# CloudMate P2C uses only the Python standard library.
+# Python >= 3.10 is required; no pip packages need installation.
+# External tools: Git and Docker Engine (running and accessible).
